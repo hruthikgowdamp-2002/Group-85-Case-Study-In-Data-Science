@@ -1,7 +1,7 @@
 import sys, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from rag import Chunk, LexicalRetriever, clean_page_text, tokenize
+from rag import Chunk, LexicalRetriever, build_ollama_prompt, clean_page_text, select_evidence, tokenize
 
 class RetrievalTests(unittest.TestCase):
     def setUp(self):
@@ -19,5 +19,15 @@ class RetrievalTests(unittest.TestCase):
         result=self.retriever.compare("scholarship correspondence")
         self.assertEqual(len(result["bm25"]),3)
         self.assertEqual(len(result["tfidf"]),3)
+    def test_select_evidence_removes_duplicate_top_result(self):
+        evidence=select_evidence(self.retriever.compare("return WIL grant funds"))
+        self.assertEqual(len(evidence),1)
+        self.assertEqual(evidence[0]["section"],"8.131")
+    def test_prompt_contains_question_and_retrieved_text(self):
+        evidence=select_evidence(self.retriever.compare("return WIL grant funds"))
+        prompt=build_ollama_prompt("Must I repay the WIL grant?",evidence)
+        self.assertIn("Must I repay the WIL grant?",prompt)
+        self.assertIn("return the grant funds",prompt)
+        self.assertIn("Page 2, Section 8.131 WIL Grant",prompt)
 
 if __name__ == "__main__": unittest.main()

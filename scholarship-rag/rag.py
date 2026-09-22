@@ -1,6 +1,7 @@
 """PDF ingestion plus BM25 and TF-IDF retrieval for the scholarship document."""
 from __future__ import annotations
 import json, math, re
+from urllib import error, request
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -9,6 +10,12 @@ from typing import Iterable
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:['-][a-z0-9]+)?")
 SECTION_RE = re.compile(r"(?m)^(\d+(?:\.\d+)*)(?:\.)?\s+([^\n]{3,120})$")
 STOPWORDS = {"a","an","and","are","as","at","be","by","can","do","for","from","how","i","if","in","is","it","my","of","on","or","that","the","this","to","what","when","where","which","who","will","with","you","your","rmit"}
+
+OLLAMA_SYSTEM_PROMPT = """You are a scholarship information assistant.
+Answer only from the supplied document excerpts. If the excerpts do not contain
+the answer, say that the available scholarship document does not provide enough
+information. Do not invent requirements, dates, amounts, or policies. Keep the
+answer concise and do not add a Sources section; the program prints sources."""
 
 def tokenize(text: str) -> list[str]:
     return [token for token in TOKEN_RE.findall(text.lower()) if token not in STOPWORDS]
@@ -122,4 +129,56 @@ class LexicalRetriever:
 
     def _ranked(self, scores: list[float], top_k: int) -> list[dict]:
         order = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)[:top_k]
-        return [{"rank":rank,"score":round(scores[i],6),"chunk_id":self.chunks[i].id,"page":self.chunks[i].page,"section":self.chunks[i].section,"title":self.chunks[i].title,"citation":self.chunks[i].citation} for rank,i in enumerate(order,start=1)]
+        return [{"rank":rank,"score":round(scores[i],6),"chunk_id":self.chunks[i].id,"page":self.chunks[i].page,"section":self.chunks[i].section,"title":self.chunks[i].title,"citation":self.chunks[i].citation,"text":self.chunks[i].text} for rank,i in enumerate(order,start=1)]
+
+def select_evidence(comparison: dict) -> list[dict]:
+    """Use each algorithm's best result, without sending a duplicate chunk."""
+    selected = []
+    seen = set()
+    for method in ("bm25", "tfidf"):
+        if comparison[method]:
+            result = comparison[method][0]
+            if result["chunk_id"] not in seen:
+                selected.append(result)
+                seen.add(result["chunk_id"])
+    return selected
+
+def build_ollama_prompt(question: str, evidence: list[dict]) -> str:
+    excerpts = "\n\n".join(
+        f"Excerpt {number} ({item['citation']}):\n{item['text']}"
+        for number, item in enumerate(evidence, start=1)
+    )
+    return f"Document excerpts:\n{excerpts}\n\nStudent question: {question}\n\nAnswer:"
+
+def generate_ollama_answer(
+    question: str,
+    evidence: list[dict],
+    model: str = "llama3.2:3b",
+    base_url: str = "http://localhost:11434",
+) -> str:
+    """Ask a local Ollama model to answer from the retrieved evidence only."""
+    payload = json.dumps({
+        "model": model,
+        "system": OLLAMA_SYSTEM_PROMPT,
+        "prompt": build_ollama_prompt(question, evidence),
+        "stream": False,
+        "options": {"temperature": 0},
+    }).encode("utf-8")
+    api_request = request.Request(
+        f"{base_url.rstrip('/')}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(api_request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Could not get an answer from Ollama. Make sure Ollama is running "
+            f"at {base_url} and that model '{model}' is installed."
+        ) from exc
+    answer = result.get("response", "").strip()
+    if not answer:
+        raise RuntimeError("Ollama returned an empty answer.")
+    return answer
